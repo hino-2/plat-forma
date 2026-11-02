@@ -1201,15 +1201,88 @@ stateDiagram-v2
   - **контрактные** — схема API и вебхуков не ломается между версиями;
   - **property-based** — для любой последовательности событий сумма проводок = 0 и `available >= 0`.
 
+#### Gherkin: бизнес-сценарии
+
+Все сценарии используют тариф и числа из §4.2 и §6.5. Шаги на английском, чтобы их без перевода связать с кодом шагов (step definitions).
+
 ```gherkin
+Background:
+  Given tariff "default": commission 10%, Russian card MDR 2%, reserve 5% for 30 days,
+    payout fee 1% min 30.00 RUB, refund_mdr_payer "seller", refund_commission "return",
+    chargeback_fee_payer "seller"
+
+# G1. Разложение продажи (§4.2): 1000 − 20 MDR − 100 комиссия = 880; резерв 880 × 5% = 44; доступно 880 − 44 = 836
 Scenario: Sale with MDR passed on to the seller
-  Given tariff "default": commission 10%, Russian card MDR 2%, reserve 5% for 30 days
   When the buyer paid 1000.00 RUB for a key with a Russian card
   And the order is confirmed
   Then the seller's "available" account holds 836.00 RUB
   And the seller's "reserve" account holds 44.00 RUB
   And the platform's "commission" revenue is 100.00 RUB
+
+# G2. Выплата с минимальной комиссией: max(836 × 1% = 8.36, 30) = 30; на карту 836 − 30 = 806
+Scenario: Payout charges the minimum fee
+  Given the seller's "available" account holds 836.00 RUB
+  When the seller requests a payout of 836.00 RUB
+  Then the payout is approved with 806.00 RUB to pay and a fee of 30.00 RUB
+  And the seller's "available" account holds 0.00 RUB
+  And a second payout request of 1.00 RUB is rejected as "insufficient funds"
+
+# G3. Частичный возврат 400 в холде (§6.5, ситуация B): с продавца 352 + 8 MDR = 360, с платформы 40 комиссии;
+#     после подтверждения из холда снимается 880 − 360 = 520: резерв 44, доступно 520 − 44 = 476
+Scenario: Partial refund before the order is confirmed
+  Given the buyer paid 1000.00 RUB for a key with a Russian card
+  When the platform refunds 400.00 RUB to the buyer
+  And the order is confirmed
+  Then the seller's "available" account holds 476.00 RUB
+  And the seller's "reserve" account holds 44.00 RUB
+  And the platform's "commission" revenue is 60.00 RUB
+
+# G4. Chargeback после выплаты, штраф 500 (§6.5, CB1/CB2): с продавца 880 + 20 + 500 = 1400;
+#     из резерва 44, в долг 1400 − 44 = 1356; выигрыш возвращает 1400: долг гасится, 44 в доступно
+Scenario: Chargeback after payout creates debt and is reversed when won
+  Given the buyer paid 1000.00 RUB, the order is confirmed and 836.00 RUB is paid out
+  When the acquirer opens a chargeback for 1000.00 RUB with a fee of 500.00 RUB
+  Then the seller's "reserve" account holds 0.00 RUB
+  And the seller's "debt" account holds 1356.00 RUB
+  When the chargeback is won
+  Then the seller's "debt" account holds 0.00 RUB
+  And the seller's "available" account holds 44.00 RUB
+  And the platform's "chargeback fee" expense is 500.00 RUB
+
+# G5. Снимок тарифа (§4.3, S4, S5): повышение комиссии вступает в силу через 45 дней после объявления;
+#     до этой даты продажа считается по 10% (1000 × 10% = 100), после — по 12% (1000 × 12% = 120)
+Scenario: Commission increase applies only to sales after its effective date
+  Given on 2026-11-02 the platform announces commission 12% effective from 2026-12-17
+  When the buyer pays 1000.00 RUB on 2026-12-16
+  And the buyer pays 1000.00 RUB on 2026-12-17
+  Then the first sale's commission is 100.00 RUB and the seller is credited 880.00 RUB
+  And the second sale's commission is 120.00 RUB and the seller is credited 860.00 RUB
+  And announcing commission 12% effective from 2026-12-01 is rejected as "notice period too short"
 ```
+
+#### Integration: реальный PostgreSQL
+
+Поднимается настоящий PostgreSQL (например, Testcontainers) с теми же миграциями, триггерами и RLS, что в проде. Моки базы не годятся: именно база защищает главные инварианты (§5.4).
+
+| # | Что проверяем | Шаги | Ожидаемый результат | Инварианты |
+|---|---|---|---|---|
+| I1 | Двойной вывод | У продавца `available` = 836. Два параллельных `POST /v1/payouts` по 836 с разными ключами идемпотентности, запуск через барьер, чтобы стартовали одновременно | Ровно один `201`, второй `422 insufficient funds`. `available` = 0, в журнале одна T5. Повторить 100 раз: результат всегда тот же | B2, P1 |
+| I2 | Идемпотентность и обрыв ответа | `POST /v1/sales/captured` с ключом K; в тесте рвём соединение после commit, до ответа. Ретрай с K. Затем запрос с K и другим телом | Ретрай возвращает тот же `201` и разложение, в журнале одна транзакция и одна строка `sale_breakdowns`, в `outbox` одно событие. Другое тело — `422` | S1, I1, I2 |
+| I3 | Гонка дворника и ручного подтверждения | Продажа с истёкшим холдом, платёж найден в реестре. Параллельно: запуск дворника и `POST /v1/sales/{id}/complete`. Отдельно: продажа без совпадения в реестре | Ровно одна T3, `hold_released_tx` заполнен один раз. Продажа без реестра остаётся в холде, T3 нет | S2, S3, S7 |
+| I4 | Изоляция платформ | Две платформы A и B, у каждой продавец. Ключом A читать баланс продавца B. Под ролью приложения с `tenant_id` = A выполнить `select * from postings` без фильтра. Записать posting A на счёт B | Чтение через API — `404` (не `403`, чтобы не раскрывать существование). SQL видит только строки A (RLS). Запись падает на составном FK | I3, L6 |
+| I5 | База ловит баг в коде | В обход сервиса: вставить несбалансированную транзакцию (+100 / −90); `UPDATE` и `DELETE` строки `postings`; `UPDATE account_balances` в минус; транзакция с проводками и откатом | Commit несбалансированной транзакции отклонён отложенным триггером. `UPDATE`/`DELETE` журнала запрещены. `CHECK (balance >= 0)` срабатывает. После отката нет ни проводок, ни события в `outbox` | L1, L3, B2, I2 |
+
+#### Property-based: случайные последовательности событий
+
+Генератор (например, fast-check) строит случайную историю: продажи с разными ценами и тарифами в basis points, подтверждения, частичные и полные возвраты, chargeback с исходами, выплаты с исходами `paid`, `failed`, `canceled`, запуски дворника, сдвиги времени. Каждая команда может прийти дважды (ретрай). После каждого шага проверяются свойства ниже. При падении fast-check сам сокращает историю до минимальной, которая ломает свойство.
+
+| # | Свойство | Почему важно | Инварианты |
+|---|---|---|---|
+| PB1 | Сумма posting'ов каждой транзакции = 0 по каждой валюте, и сумма всех posting'ов платформы = 0 | Деньги не появляются и не исчезают при любом порядке событий | L1, L2 |
+| PB2 | Для любой цены и любого тарифа доли продажи ≥ 0 и в сумме дают номинал до копейки. Для любой серии частичных возвратов по продаже их доли в сумме равны долям полного возврата | Проверяет округление `HALF_UP` и правило «доля продавца — разность, последний возврат забирает остатки» на всех граничных ценах (1 копейка, нечётные суммы) | M1, M2, L8 |
+| PB3 | `pending`, `available`, `reserve` ≥ 0, и никогда одновременно `available > 0` и `debt > 0` | Никакая комбинация возвратов, chargeback и выплат не уводит баланс в минус и не оставляет долг при наличии денег | B2, B3, B5 |
+| PB4 | История с дублями команд даёт то же состояние, что и без дублей. Хранимые балансы = пересчёт из журнала | Ретраи безопасны, а хранимый баланс не расходится с журналом | S1, S2, I1, B1 |
+| PB5 | Модель состояний: каждый переход статуса продажи и выплаты есть в списке разрешённых (§6.4), статус соответствует журналу, `payout_in_transit` = сумма `к выплате` по выплатам в `approved` и `sent`, деньги покрывают обязательства перед продавцами | Ловит недопустимые переходы (`sent → canceled`) и рассинхрон статуса с проводками | S6, P3, P4, P5, M3 |
 
 ## 11. Trade-offs, которые стоит проговорить
 
